@@ -9,28 +9,28 @@ import torch
 
 def ensure_model_downloaded(model_path, repo_id="ByteDance-Seed/Seed-X-PPO-7B"):
     """
-    确保模型已下载，如果不存在则自动下载
+    Ensure model is downloaded, auto-download if not exists
     """
     if not os.path.exists(model_path):
-        print(f"模型目录不存在: {model_path}")
-        print(f"正在从 Hugging Face 下载模型: {repo_id}")
+        print(f"Model directory does not exist: {model_path}")
+        print(f"Downloading model from Hugging Face: {repo_id}")
         try:
-            # 创建父目录
+            # Create parent directory
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             
-            # 下载模型
+            # Download model
             snapshot_download(
                 repo_id=repo_id,
                 local_dir=model_path,
                 local_dir_use_symlinks=False,
                 resume_download=True
             )
-            print(f"模型下载完成: {model_path}")
+            print(f"Model download completed: {model_path}")
         except Exception as e:
-            print(f"模型下载失败: {e}")
+            print(f"Model download failed: {e}")
             raise e
     else:
-        print(f"模型已存在: {model_path}")
+        print(f"Model already exists: {model_path}")
 
 def translate(**kwargs):
     try:
@@ -41,14 +41,23 @@ def translate(**kwargs):
         dst_code = kwargs.get('dst_code')
         model_path = os.path.join(folder_paths.models_dir, 'Seed-X-PPO-7B')
 
-        # 确保模型已下载
+        # Ensure model is downloaded
         ensure_model_downloaded(model_path)
 
         message = f'No CoT. Translate the following {src} sentence into {dst}:\n{prompt} <{dst_code}>'
         #print(message)
 
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to('cuda')
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to('cuda')
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+        except Exception as model_error:
+            error_msg = f"Failed to load model from {model_path}. Error: {model_error}"
+            print(error_msg)
+            print("The model files may be incomplete or corrupted.")
+            print("Please check the model directory and consider deleting it to re-download:")
+            print(f"Model path: {model_path}")
+            print("You can delete the entire model directory and run again to re-download the model.")
+            return f'Model loading failed: {error_msg}. Please delete model directory and re-download.'
 
         inputs = tokenizer(message, return_tensors="pt").to("cuda")
         outputs = model.generate(**inputs, max_new_tokens=50)
@@ -58,10 +67,10 @@ def translate(**kwargs):
         if match:
             return match.group(1)
         else:
-            return 'failed to translate!'
+            return 'Failed to translate!'
     except Exception as e:
-        print(e)
-        return 'failed to translate!'
+        print(f"Translation error: {e}")
+        return 'Failed to translate!'
 
 class RH_SeedXPro_Translator:
 
