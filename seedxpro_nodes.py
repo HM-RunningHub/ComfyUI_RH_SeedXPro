@@ -32,10 +32,162 @@ def ensure_model_downloaded(model_path, repo_id="ByteDance-Seed/Seed-X-PPO-7B"):
     else:
         print(f"Model already exists: {model_path}")
 
+def split_text_into_chunks(text, max_chunk_size=500):
+    """
+    Split long text into smaller chunks for translation
+    """
+    if len(text) <= max_chunk_size:
+        return [text]
+    
+    # Try to split by sentences first
+    sentences = re.split(r'[.!?。！？]\s*', text)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk + sentence) <= max_chunk_size:
+            current_chunk += sentence + ". " if sentence else ""
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + ". " if sentence else ""
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    # If chunks are still too long, split by characters
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) <= max_chunk_size:
+            final_chunks.append(chunk)
+        else:
+            # Split long chunk by characters
+            for i in range(0, len(chunk), max_chunk_size):
+                final_chunks.append(chunk[i:i + max_chunk_size])
+    
+    return final_chunks
+
+def extract_translation_from_output(output, dst_code):
+    """
+    Extract translation from model output using multiple strategies
+    """
+    # Strategy 1: Standard pattern with language code
+    patterns = [
+        f'<{dst_code}>(.*?)(?:<(?!/)|$)',  # Stop at next tag or end
+        f'<{dst_code}>(.*)',               # Everything after the tag
+        f'{dst_code}>(.*?)(?:<|$)',        # Without opening bracket
+        f'<{dst_code}>\s*(.*?)(?:\n\n|$)', # Stop at double newline or end
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, output, re.DOTALL | re.IGNORECASE)
+        if match:
+            result = match.group(1).strip()
+            if result and len(result) > 0:
+                return result
+    
+    # Strategy 2: Find text after the language code marker
+    lines = output.split('\n')
+    found_marker = False
+    result_lines = []
+    
+    for line in lines:
+        if f'<{dst_code}>' in line or f'{dst_code}>' in line:
+            found_marker = True
+            # Extract text after the marker in the same line
+            parts = re.split(f'<{dst_code}>|{dst_code}>', line, 1)
+            if len(parts) > 1 and parts[1].strip():
+                result_lines.append(parts[1].strip())
+            continue
+        
+        if found_marker:
+            # Stop if we hit another language tag
+            if re.search(r'<[a-z]{2}>', line, re.IGNORECASE):
+                break
+            result_lines.append(line)
+    
+    if result_lines:
+        return '\n'.join(result_lines).strip()
+    
+    return None
+
+def translate_single_chunk(chunk, src, dst, dst_code, model, tokenizer):
+    """
+    Translate a single chunk of text
+    """
+    # Simplified prompt format for better results
+    message = f"Translate from {src} to {dst}:\n{chunk}\n\nTranslation in {dst} <{dst_code}>:"
+    
+    inputs = tokenizer(message, return_tensors="pt").to("cuda")
+    input_length = inputs['input_ids'].shape[1]
+    
+    # Conservative token calculation
+    max_tokens = min(1024, max(150, len(chunk) * 2))
+    
+    print(f"Translating chunk (length: {len(chunk)}), max_tokens: {max_tokens}")
+    
+    # Multiple attempts with different parameters
+    for attempt in range(2):
+        try:
+            if attempt == 0:
+                # First attempt: greedy decoding
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    temperature=1.0,
+                    repetition_penalty=1.05,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+            else:
+                # Second attempt: with sampling
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=True,
+                    temperature=0.8,
+                    top_p=0.9,
+                    repetition_penalty=1.1,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+            
+            res = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract translation
+            translation = extract_translation_from_output(res, dst_code)
+            
+            if translation and len(translation.strip()) > 0:
+                print(f"Chunk translated successfully (attempt {attempt + 1})")
+                return translation
+            else:
+                print(f"Attempt {attempt + 1} failed to extract translation")
+                print(f"Output: {res}")
+                
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed with error: {e}")
+            continue
+    
+    # If all attempts failed, return original chunk with a note
+    return f"[Translation failed for: {chunk}]"
+
 def translate(**kwargs):
     try:
         prompt = kwargs.get('prompt')
-        prompt = re.sub(r'[\x00-\x1f\x7f]', '', prompt)
+        original_length = len(prompt)
+        
+        # Only remove truly problematic control characters
+        prompt = re.sub(r'[\x00\x01-\x08\x0b\x0c\x0e-\x1f\x7f]', '', prompt)
+        
+        # Log if any characters were removed
+        if len(prompt) != original_length:
+            removed_count = original_length - len(prompt)
+            print(f"Warning: Removed {removed_count} problematic control character(s) from input")
+        
+        if not prompt.strip():
+            return "Error: Empty input after cleaning"
+        
         src = kwargs.get('from')
         dst = kwargs.get('to')
         dst_code = kwargs.get('dst_code')
@@ -43,9 +195,6 @@ def translate(**kwargs):
 
         # Ensure model is downloaded
         ensure_model_downloaded(model_path)
-
-        message = f'No CoT. Translate the following {src} sentence into {dst}:\n{prompt} <{dst_code}>'
-        #print(message)
 
         try:
             model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to('cuda')
@@ -59,18 +208,33 @@ def translate(**kwargs):
             print("You can delete the entire model directory and run again to re-download the model.")
             return f'Model loading failed: {error_msg}. Please delete model directory and re-download.'
 
-        inputs = tokenizer(message, return_tensors="pt").to("cuda")
-        outputs = model.generate(**inputs, max_new_tokens=50)
-        res = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        match = re.search(f'<{dst_code}>(.*)', res)
-        if match:
-            return match.group(1)
+        print(f"Starting translation. Input length: {len(prompt)} characters")
+        
+        # Split text into manageable chunks if necessary
+        chunks = split_text_into_chunks(prompt, max_chunk_size=400)
+        print(f"Split into {len(chunks)} chunk(s)")
+        
+        if len(chunks) == 1:
+            # Single chunk, translate directly
+            result = translate_single_chunk(chunks[0], src, dst, dst_code, model, tokenizer)
         else:
-            return 'Failed to translate!'
+            # Multiple chunks, translate each and combine
+            translated_chunks = []
+            for i, chunk in enumerate(chunks):
+                print(f"Translating chunk {i + 1}/{len(chunks)}")
+                translation = translate_single_chunk(chunk, src, dst, dst_code, model, tokenizer)
+                translated_chunks.append(translation)
+            
+            result = ' '.join(translated_chunks)
+        
+        print(f"Translation completed. Final output length: {len(result)} characters")
+        return result
+        
     except Exception as e:
         print(f"Translation error: {e}")
-        return 'Failed to translate!'
+        import traceback
+        traceback.print_exc()
+        return f'Translation failed: {str(e)}'
 
 class RH_SeedXPro_Translator:
 
